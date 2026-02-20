@@ -1,4 +1,4 @@
-name: Daily Hi Email
+name: Daily MedTech Top Headline Email
 
 on:
   schedule:
@@ -31,7 +31,7 @@ jobs:
             echo "send=false" >> "${GITHUB_OUTPUT}"
           fi
 
-      - name: Send daily hi email
+      - name: Send daily top headline email
         if: github.event_name == 'workflow_dispatch' || steps.check_time.outputs.send == 'true'
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -41,4 +41,5 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SMTP_SECURITY: ${{ secrets.SMTP_SECURITY }}
+          TOP_NEWS_QUERY: ${{ secrets.TOP_NEWS_QUERY }}
         run: python send_daily_hi.py
