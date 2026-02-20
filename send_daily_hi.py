@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import os
 import re
 import smtplib
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from typing import Iterable
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 from urllib.request import Request, urlopen
 
 
@@ -23,9 +21,7 @@ def require_env(name: str) -> str:
 
 
 USER_AGENT = "daily-medtech-headline-bot/1.0 (contact: recdosec@gmail.com)"
-GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
-DEFAULT_QUERY = 'medtech OR biomedical OR "medical device"'
 STOPWORDS = {
     "the",
     "and",
@@ -48,34 +44,49 @@ STOPWORDS = {
     "news",
 }
 
+KEYWORDS = {
+    "medtech",
+    "biomedical",
+    "biotech",
+    "medical",
+    "device",
+    "fda",
+    "trial",
+    "clinical",
+    "diagnostic",
+    "diagnostics",
+    "therapeutic",
+    "therapeutics",
+    "imaging",
+    "surgical",
+    "robotic",
+}
+
+
+@dataclass(frozen=True)
+class Outlet:
+    name: str
+    domain: str
+    weight: float
+
+
+OUTLETS: list[Outlet] = [
+    Outlet(name="MedTech Dive", domain="medtechdive.com", weight=1.25),
+    Outlet(name="MassDevice", domain="massdevice.com", weight=1.20),
+    Outlet(name="Fierce Biotech", domain="fiercebiotech.com", weight=1.15),
+    Outlet(name="STAT", domain="statnews.com", weight=1.10),
+    Outlet(name="MedCity News", domain="medcitynews.com", weight=1.05),
+]
+
 
 @dataclass
 class NewsItem:
     title: str
     url: str
-    domain: str
+    outlet_name: str
+    outlet_domain: str
     published_at: datetime
-    source_type: str
-
-
-@dataclass
-class HeadlineCluster:
-    items: list[NewsItem] = field(default_factory=list)
-    tokens: set[str] = field(default_factory=set)
-    domains: set[str] = field(default_factory=set)
-    source_types: set[str] = field(default_factory=set)
-
-    def add(self, item: NewsItem, item_tokens: set[str]) -> None:
-        self.items.append(item)
-        if not self.tokens:
-            self.tokens = set(item_tokens)
-        else:
-            self.tokens |= item_tokens
-        self.domains.add(item.domain)
-        self.source_types.add(item.source_type)
-
-    def most_recent(self) -> datetime:
-        return max(item.published_at for item in self.items)
+    score: float = 0.0
 
 
 def fetch_text(url: str) -> str:
@@ -124,176 +135,132 @@ def normalize_tokens(text: str) -> set[str]:
     return set(tokens)
 
 
-def jaccard_similarity(left: set[str], right: set[str]) -> float:
-    if not left or not right:
-        return 0.0
-    union = left | right
-    if not union:
-        return 0.0
-    return len(left & right) / len(union)
+def normalize_title_key(title: str) -> str:
+    value = re.sub(r"[^a-z0-9\s]", " ", title.lower())
+    value = re.sub(r"\s+", " ", value).strip()
+    tokens = [tok for tok in value.split() if tok not in STOPWORDS]
+    return " ".join(tokens[:16])
 
 
-def fetch_google_news_items(query: str, max_items: int = 35) -> list[NewsItem]:
-    url = (
-        f"{GOOGLE_NEWS_RSS}?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
+def relevance_score(title: str) -> float:
+    tokens = normalize_tokens(title)
+    hits = sum(1 for token in tokens if token in KEYWORDS)
+    return min(4.0, hits * 0.8)
+
+
+def recency_score(published_at: datetime) -> float:
+    age_hours = max(
+        0.0, (datetime.now(timezone.utc) - published_at).total_seconds() / 3600.0
     )
+    return max(0.0, (96.0 - age_hours) / 24.0)
+
+
+def build_outlet_query(outlet: Outlet) -> str:
+    return (
+        f'site:{outlet.domain} '
+        '("medical device" OR medtech OR biomedical OR biotech)'
+    )
+
+
+def fetch_outlet_items(outlet: Outlet, max_items: int = 8) -> list[NewsItem]:
+    query = build_outlet_query(outlet)
+    url = f"{GOOGLE_NEWS_RSS}?q={quote_plus(query)}&hl=en-US&gl=US&ceid=US:en"
     try:
         xml_text = fetch_text(url)
         root = ET.fromstring(xml_text)
     except Exception as exc:
-        print(f"Warning: Google News fetch failed: {exc}")
+        print(f"Warning: {outlet.name} fetch failed: {exc}")
         return []
 
     rows: list[NewsItem] = []
     for item_el in root.findall("./channel/item"):
         raw_title = (item_el.findtext("title") or "").strip()
         link = (item_el.findtext("link") or "").strip()
-        source = (item_el.findtext("source") or "").strip() or "Google News"
+        source = (item_el.findtext("source") or "").strip() or outlet.name
         pub_date = safe_datetime(item_el.findtext("pubDate"))
         if not raw_title or not link:
             continue
 
-        rows.append(
-            NewsItem(
-                title=strip_source_suffix(raw_title, source),
-                url=link,
-                domain=source,
-                published_at=pub_date,
-                source_type="google_news",
-            )
+        title = strip_source_suffix(raw_title, source)
+        item = NewsItem(
+            title=title,
+            url=link,
+            outlet_name=outlet.name,
+            outlet_domain=outlet.domain,
+            published_at=pub_date,
         )
-    return rows[:max_items]
+        item.score = outlet.weight + relevance_score(title) + recency_score(pub_date)
+        rows.append(
+            item
+        )
+    return sorted(rows, key=lambda row: row.score, reverse=True)[:max_items]
 
 
-def fetch_gdelt_items(query: str, max_items: int = 45) -> list[NewsItem]:
-    url = (
-        f"{GDELT_DOC_API}?query={quote_plus(query)}&mode=ArtList"
-        f"&format=json&sort=DateDesc&maxrecords={max_items}"
-    )
+def desired_headline_count() -> int:
+    raw = os.getenv("HEADLINE_COUNT", "4").strip()
     try:
-        payload = json.loads(fetch_text(url))
-    except Exception as exc:
-        print(f"Warning: GDELT fetch failed: {exc}")
-        return []
-    rows: list[NewsItem] = []
-    for article in payload.get("articles", []):
-        title = (article.get("title") or "").strip()
-        link = (article.get("url") or "").strip()
-        domain = (article.get("domain") or "").strip()
-        if not domain and link:
-            domain = urlparse(link).netloc or "web"
-        if not title or not link:
+        value = int(raw)
+    except ValueError:
+        value = 4
+    if value < 3:
+        return 3
+    if value > 4:
+        return 4
+    return value
+
+
+def collect_top_headlines() -> list[NewsItem]:
+    collected: list[NewsItem] = []
+    for outlet in OUTLETS:
+        collected.extend(fetch_outlet_items(outlet))
+
+    deduped: list[NewsItem] = []
+    seen: set[str] = set()
+    for item in sorted(collected, key=lambda row: (row.score, row.published_at), reverse=True):
+        key = normalize_title_key(item.title)
+        if not key:
             continue
-        rows.append(
-            NewsItem(
-                title=title,
-                url=link,
-                domain=domain or "web",
-                published_at=safe_datetime(article.get("seendate")),
-                source_type="gdelt",
-            )
-        )
-    return rows
-
-
-def cluster_headlines(items: Iterable[NewsItem]) -> list[HeadlineCluster]:
-    clusters: list[HeadlineCluster] = []
-    for item in sorted(items, key=lambda row: row.published_at, reverse=True):
-        item_tokens = normalize_tokens(item.title)
-        if not item_tokens:
+        if key in seen:
             continue
+        seen.add(key)
+        deduped.append(item)
 
-        best_idx = -1
-        best_sim = 0.0
-        for idx, cluster in enumerate(clusters):
-            sim = jaccard_similarity(item_tokens, cluster.tokens)
-            if sim > best_sim:
-                best_sim = sim
-                best_idx = idx
-
-        if best_idx >= 0 and best_sim >= 0.52:
-            clusters[best_idx].add(item, item_tokens)
-        else:
-            new_cluster = HeadlineCluster()
-            new_cluster.add(item, item_tokens)
-            clusters.append(new_cluster)
-    return clusters
-
-
-def cluster_score(cluster: HeadlineCluster) -> float:
-    now = datetime.now(timezone.utc)
-    recency_hours = max(
-        0.0, (now - cluster.most_recent()).total_seconds() / 3600.0
-    )
-    recency_factor = max(0.0, (72.0 - recency_hours) / 72.0)
-    mentions = len(cluster.items)
-    unique_domains = len(cluster.domains)
-    cross_source_bonus = 2.0 if len(cluster.source_types) >= 2 else 0.0
-    return mentions * 3.0 + unique_domains * 2.0 + cross_source_bonus + recency_factor
-
-
-def pick_representative(cluster: HeadlineCluster) -> NewsItem:
-    source_priority = {"gdelt": 2, "google_news": 1}
-    return sorted(
-        cluster.items,
-        key=lambda row: (
-            source_priority.get(row.source_type, 0),
-            row.published_at,
-        ),
-        reverse=True,
-    )[0]
+    return deduped[: desired_headline_count()]
 
 
 def build_top_headline_message() -> tuple[str, str]:
-    query = os.getenv("TOP_NEWS_QUERY", DEFAULT_QUERY).strip() or DEFAULT_QUERY
-    google_items = fetch_google_news_items(query=query)
-    gdelt_items = fetch_gdelt_items(query=query)
-    all_items = google_items + gdelt_items
-
-    clusters = cluster_headlines(all_items)
-    if not clusters:
-        subject = f"Daily MedTech Top Headline | {datetime.now(timezone.utc).date().isoformat()}"
+    top_items = collect_top_headlines()
+    if not top_items:
+        subject = (
+            f"Daily MedTech/Biomedical Headlines | "
+            f"{datetime.now(timezone.utc).date().isoformat()}"
+        )
         body = (
-            "No biomedical/medtech headline could be confidently selected today.\n"
-            "Sources checked: Google News RSS, GDELT.\n"
+            "No headlines were found today from the selected medtech/biomedical outlets.\n"
+            "Checked outlets: "
+            + ", ".join(outlet.name for outlet in OUTLETS)
+            + "\n"
         )
         return subject, body
 
-    best_cluster = sorted(
-        clusters,
-        key=lambda c: (cluster_score(c), c.most_recent()),
-        reverse=True,
-    )[0]
-    top = pick_representative(best_cluster)
-    cross_ref_status = (
-        "Cross-referenced across multiple sources"
-        if len(best_cluster.source_types) >= 2 or len(best_cluster.domains) >= 2
-        else "Single-source fallback"
+    subject = (
+        f"Top {len(top_items)} MedTech/Biomedical Headlines | "
+        f"{datetime.now(timezone.utc).date().isoformat()}"
     )
-
-    unique_links: list[str] = []
-    seen_links: set[str] = set()
-    for item in sorted(best_cluster.items, key=lambda row: row.published_at, reverse=True):
-        if item.url in seen_links:
-            continue
-        seen_links.add(item.url)
-        unique_links.append(f"- {item.domain}: {item.url}")
-        if len(unique_links) >= 5:
-            break
-
-    subject = f"Daily MedTech Top Headline | {datetime.now(timezone.utc).date().isoformat()}"
-    body = (
-        f"Top Headline:\n{top.title}\n\n"
-        f"Primary Link:\n{top.url}\n\n"
-        f"Selection Notes:\n"
-        f"- Status: {cross_ref_status}\n"
-        f"- Matching headlines found: {len(best_cluster.items)}\n"
-        f"- Unique domains: {len(best_cluster.domains)}\n"
-        f"- Sources used: {', '.join(sorted(best_cluster.source_types))}\n\n"
-        "Other matching links:\n"
-        f"{os.linesep.join(unique_links)}\n\n"
-        f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}\n"
+    lines: list[str] = []
+    lines.append(
+        f"Top {len(top_items)} headlines from selected outlets "
+        f"({', '.join(outlet.name for outlet in OUTLETS)}):"
     )
+    lines.append("")
+    for index, item in enumerate(top_items, start=1):
+        lines.append(f"{index}. {item.title}")
+        lines.append(f"   Outlet: {item.outlet_name}")
+        lines.append(f"   Published (UTC): {item.published_at.strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"   Link: {item.url}")
+        lines.append("")
+    lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
+    body = "\n".join(lines).strip() + "\n"
     return subject, body
 
 

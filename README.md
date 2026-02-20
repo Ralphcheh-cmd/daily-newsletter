@@ -1,11 +1,12 @@
 # Daily MedTech/Biomedical Top Headline Email (GitHub Actions)
 
-This project sends one daily email containing:
+This project sends one daily email containing the top 3-4 biomedical/medtech headlines from 5 selected outlets:
 
-- The top biomedical/medtech headline
-- A primary link
-- Cross-reference details (how many matching mentions/domains were found)
-- Additional matching links
+- MedTech Dive
+- MassDevice
+- Fierce Biotech
+- STAT
+- MedCity News
 
 It runs on GitHub Actions cloud (your PC can be off).
 
@@ -24,7 +25,7 @@ Set these in:
 
 Optional:
 
-- `TOP_NEWS_QUERY` (custom search query; defaults to medtech/biomedical terms)
+- `HEADLINE_COUNT` (3 or 4, defaults to 4)
 
 ## Schedule
 

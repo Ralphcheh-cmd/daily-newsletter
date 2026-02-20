@@ -41,5 +41,5 @@ jobs:
           SMTP_FROM: ${{ secrets.SMTP_FROM }}
           SMTP_TO: ${{ secrets.SMTP_TO }}
           SMTP_SECURITY: ${{ secrets.SMTP_SECURITY }}
-          TOP_NEWS_QUERY: ${{ secrets.TOP_NEWS_QUERY }}
+          HEADLINE_COUNT: ${{ secrets.HEADLINE_COUNT }}
         run: python send_daily_hi.py
