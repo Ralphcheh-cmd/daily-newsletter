@@ -27,6 +27,17 @@ Optional:
 
 - `HEADLINE_COUNT` (3 or 4, defaults to 4)
 
+## Email Format
+
+Each headline is formatted as:
+
+- `I - ...`
+- Context (what the company does + best product)
+- Product explanation in simple wording
+- Product explanation in scientific wording
+- Implications / likely consequences
+- Link / date of release
+
 ## Schedule
 
 Workflow file:

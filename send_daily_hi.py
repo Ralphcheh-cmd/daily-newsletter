@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 from urllib.request import Request, urlopen
 
 
@@ -78,6 +78,26 @@ OUTLETS: list[Outlet] = [
     Outlet(name="MedCity News", domain="medcitynews.com", weight=1.05),
 ]
 
+ACTION_VERBS = [
+    "announces",
+    "launches",
+    "wins",
+    "receives",
+    "acquires",
+    "buys",
+    "invests",
+    "resolves",
+    "posts",
+    "reports",
+    "partners",
+    "raises",
+    "outlines",
+    "hits",
+    "doses",
+]
+
+ROLE_TOKENS = {"CTO", "CEO", "CFO", "COO", "CMO", "President"}
+
 
 @dataclass
 class NewsItem:
@@ -87,6 +107,9 @@ class NewsItem:
     outlet_domain: str
     published_at: datetime
     score: float = 0.0
+
+
+_COMPANY_PROFILE_CACHE: dict[str, tuple[str, str]] = {}
 
 
 def fetch_text(url: str) -> str:
@@ -133,6 +156,11 @@ def normalize_tokens(text: str) -> set[str]:
         if len(token) > 2 and token not in STOPWORDS and not token.isdigit()
     ]
     return set(tokens)
+
+
+def to_roman(number: int) -> str:
+    values = {1: "I", 2: "II", 3: "III", 4: "IV"}
+    return values.get(number, str(number))
 
 
 def normalize_title_key(title: str) -> str:
@@ -228,6 +256,174 @@ def collect_top_headlines() -> list[NewsItem]:
     return deduped[: desired_headline_count()]
 
 
+def clean_company_name(name: str) -> str:
+    value = re.sub(r"\s+", " ", name).strip(" -,:;.")
+    parts = value.split()
+    while parts and parts[-1] in ROLE_TOKENS:
+        parts.pop()
+    cleaned = " ".join(parts).strip()
+    return cleaned or value
+
+
+def infer_company_name(title: str) -> str:
+    possessive_match = re.search(
+        r"^([A-Za-z][A-Za-z0-9&.\-]*(?:\s+[A-Za-z][A-Za-z0-9&.\-]*){0,4})[’']s\b",
+        title,
+    )
+    if possessive_match:
+        return clean_company_name(possessive_match.group(1))
+
+    verbs = "|".join(ACTION_VERBS)
+    action_match = re.search(
+        rf"^([A-Za-z][A-Za-z0-9&.\-]*(?:\s+[A-Za-z][A-Za-z0-9&.\-]*){{0,4}})\s+(?:{verbs})\b",
+        title,
+        flags=re.IGNORECASE,
+    )
+    if action_match:
+        return clean_company_name(action_match.group(1))
+
+    # Fallback: first capitalized phrase.
+    fallback = re.search(
+        r"([A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,3})",
+        title,
+    )
+    if fallback:
+        return clean_company_name(fallback.group(1))
+    return "The company"
+
+
+def infer_product_name(title: str, company_name: str) -> str | None:
+    clean_title = title
+    if company_name and company_name != "The company":
+        clean_title = re.sub(re.escape(company_name), "", clean_title, flags=re.IGNORECASE).strip()
+    clean_title = clean_title.replace("’s", "").replace("'s", "")
+
+    for pattern in [
+        r"(?:for|with|using|on)\s+([A-Za-z0-9][^,;:.]{3,90})",
+        r"([A-Za-z0-9][A-Za-z0-9\-\s]{2,60}\s+device)",
+        r"([A-Za-z0-9][A-Za-z0-9\-\s]{2,60}\s+therapy)",
+        r"([A-Za-z0-9][A-Za-z0-9\-\s]{2,60}\s+platform)",
+    ]:
+        match = re.search(pattern, clean_title, flags=re.IGNORECASE)
+        if match:
+            candidate = re.sub(r"\s+", " ", match.group(1)).strip(" -,:;.")
+            candidate = re.sub(
+                r"^(?:announces?|launches?|wins?|receives?|acquires?|buys?|invests?|"
+                r"resolves?|posts?|reports?|partners?|raises?|outlines?|hits?|doses?)\s+",
+                "",
+                candidate,
+                flags=re.IGNORECASE,
+            )
+            candidate = re.sub(r"^(?:new|its|their)\s+", "", candidate, flags=re.IGNORECASE)
+            candidate = candidate.strip(" -,:;.")
+            lowered = candidate.lower()
+            token_count = len(candidate.split())
+            noisy_tokens = {
+                "success",
+                "strategy",
+                "relationship",
+                "capabilities",
+                "quarter",
+                "global",
+                "firsts",
+            }
+            if (
+                token_count >= 2
+                and token_count <= 8
+                and not any(token in lowered for token in noisy_tokens)
+            ):
+                return candidate
+    return None
+
+
+def fetch_company_profile(company_name: str, fallback_product: str | None) -> tuple[str, str]:
+    if company_name in _COMPANY_PROFILE_CACHE:
+        return _COMPANY_PROFILE_CACHE[company_name]
+
+    context = (
+        f"{company_name} develops medical technology solutions for healthcare providers and patients."
+    )
+    best_product = fallback_product or "Not clearly specified in the headline"
+
+    if company_name and company_name != "The company":
+        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(company_name)}"
+        try:
+            payload = fetch_text(wiki_url)
+            # Very lightweight extraction from JSON text without extra dependencies.
+            extract_match = re.search(r'"extract":"(.*?)"', payload)
+            if extract_match:
+                extract = extract_match.group(1)
+                extract = (
+                    extract.replace("\\n", " ")
+                    .replace('\\"', '"')
+                    .replace("\\/", "/")
+                )
+                first_sentence = extract.split(". ")[0].strip()
+                if first_sentence:
+                    context = first_sentence + "."
+                product_match = re.search(
+                    r"(?:known for)\s+([^.,;]{6,100})",
+                    extract,
+                    flags=re.IGNORECASE,
+                )
+                if product_match:
+                    best_product = product_match.group(1).strip()
+        except Exception:
+            pass
+
+    _COMPANY_PROFILE_CACHE[company_name] = (context, best_product)
+    return context, best_product
+
+
+def simple_product_sentence(product_name: str | None) -> str:
+    if not product_name:
+        return "The headline does not clearly name a specific product."
+    return (
+        f"In simple words, {product_name} is a medical solution meant to help doctors or patients "
+        "diagnose, monitor, or treat a health condition."
+    )
+
+
+def scientific_product_sentence(product_name: str | None) -> str:
+    if not product_name:
+        return (
+            "From a scientific perspective, no explicit intervention name is provided, so mechanism-level "
+            "interpretation remains limited."
+        )
+    return (
+        f"In scientific terms, {product_name} represents a clinical intervention or medtech modality "
+        "intended to improve measurable outcomes through targeted diagnostic or therapeutic mechanisms."
+    )
+
+
+def implications_sentence(title: str) -> str:
+    lower = title.lower()
+    if any(token in lower for token in ["fda", "approval", "clearance", "coverage nod", "ce mark"]):
+        return (
+            "These events typically increase commercialization probability, support reimbursement pathways, "
+            "and can accelerate adoption by hospitals and clinicians."
+        )
+    if any(token in lower for token in ["phase", "trial", "dosed", "study"]):
+        return (
+            "These events usually de-risk the clinical program, influence the next regulatory milestone, "
+            "and can materially affect partnership or financing leverage."
+        )
+    if any(token in lower for token in ["acquire", "acquisition", "invest", "partnership", "merger"]):
+        return (
+            "These events often lead to capability expansion, faster product development cycles, and "
+            "potential revenue synergy, while adding integration execution risk."
+        )
+    if any(token in lower for token in ["warning letter", "compliance", "resolves"]):
+        return (
+            "These events generally reduce regulatory overhang and operational risk, which can improve "
+            "supply continuity and customer confidence."
+        )
+    return (
+        "These events typically shape near-term strategic priorities and can influence market positioning, "
+        "capital allocation, and adoption momentum."
+    )
+
+
 def build_top_headline_message() -> tuple[str, str]:
     top_items = collect_top_headlines()
     if not top_items:
@@ -247,17 +443,23 @@ def build_top_headline_message() -> tuple[str, str]:
         f"Top {len(top_items)} MedTech/Biomedical Headlines | "
         f"{datetime.now(timezone.utc).date().isoformat()}"
     )
-    lines: list[str] = []
-    lines.append(
-        f"Top {len(top_items)} headlines from selected outlets "
-        f"({', '.join(outlet.name for outlet in OUTLETS)}):"
-    )
-    lines.append("")
+    lines: list[str] = ["General News:", ""]
     for index, item in enumerate(top_items, start=1):
-        lines.append(f"{index}. {item.title}")
-        lines.append(f"   Outlet: {item.outlet_name}")
-        lines.append(f"   Published (UTC): {item.published_at.strftime('%Y-%m-%d %H:%M')}")
-        lines.append(f"   Link: {item.url}")
+        company_name = infer_company_name(item.title)
+        product_name = infer_product_name(item.title, company_name)
+        context_sentence, best_product = fetch_company_profile(company_name, product_name)
+
+        lines.append(f"{to_roman(index)} - {item.title}")
+        lines.append(
+            f"Context: {context_sentence} Best product: {best_product}."
+        )
+        lines.append(f"Product (simple): {simple_product_sentence(product_name)}")
+        lines.append(f"Product (scientific): {scientific_product_sentence(product_name)}")
+        lines.append(f"Implications: {implications_sentence(item.title)}")
+        lines.append(
+            "Link / Date: "
+            f"{item.url} | {item.published_at.strftime('%Y-%m-%d %H:%M UTC')}"
+        )
         lines.append("")
     lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
     body = "\n".join(lines).strip() + "\n"
