@@ -2,7 +2,9 @@ name: Daily Hi Email
 
 on:
   schedule:
-    - cron: "0 14 * * *"
+    # GitHub cron is UTC. We run at both candidate UTC hours and gate by Beirut local time.
+    - cron: "0 6 * * *"
+    - cron: "0 7 * * *"
   workflow_dispatch:
 
 jobs:
@@ -17,7 +19,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check Beirut local hour
+        id: check_time
+        run: |
+          BEIRUT_NOW="$(TZ='Asia/Beirut' date +'%Y-%m-%d %H:%M:%S')"
+          BEIRUT_HOUR="$(TZ='Asia/Beirut' date +'%H')"
+          echo "Beirut now: ${BEIRUT_NOW}"
+          if [ "${BEIRUT_HOUR}" = "09" ]; then
+            echo "send=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "send=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Send daily hi email
+        if: github.event_name == 'workflow_dispatch' || steps.check_time.outputs.send == 'true'
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
