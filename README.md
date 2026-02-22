@@ -32,10 +32,8 @@ Optional:
 Each headline is formatted as:
 
 - `I - ...`
-- Context (what the company does + best product)
-- Product explanation in simple wording
-- Product explanation in scientific wording
-- Implications / likely consequences
+- Company research (separate lookup)
+- Product research in easy terms + engineering explanation (only if product is mentioned)
 - Link / date of release
 
 ## Schedule

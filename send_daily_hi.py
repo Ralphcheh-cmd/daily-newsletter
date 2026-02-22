@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import re
 import smtplib
@@ -109,7 +110,8 @@ class NewsItem:
     score: float = 0.0
 
 
-_COMPANY_PROFILE_CACHE: dict[str, tuple[str, str]] = {}
+_COMPANY_PROFILE_CACHE: dict[str, str] = {}
+_WIKIPEDIA_SUMMARY_CACHE: dict[str, dict[str, str] | None] = {}
 
 
 def fetch_text(url: str) -> str:
@@ -336,92 +338,212 @@ def infer_product_name(title: str, company_name: str) -> str | None:
     return None
 
 
-def fetch_company_profile(company_name: str, fallback_product: str | None) -> tuple[str, str]:
+def parse_json(text: str) -> dict | None:
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def first_sentences(text: str, count: int = 2) -> str:
+    cleaned = normalize_spaces(text.replace("\n", " "))
+    chunks = [chunk.strip() for chunk in re.split(r"(?<=[.!?])\s+", cleaned) if chunk.strip()]
+    if not chunks:
+        return ""
+    return " ".join(chunks[:count]).strip()
+
+
+def wikipedia_summary(term: str) -> dict[str, str] | None:
+    key = term.strip().lower()
+    if not key:
+        return None
+    if key in _WIKIPEDIA_SUMMARY_CACHE:
+        return _WIKIPEDIA_SUMMARY_CACHE[key]
+
+    def fetch_summary_direct(title: str) -> dict[str, str] | None:
+        url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(title)}"
+        try:
+            payload = parse_json(fetch_text(url))
+        except Exception:
+            return None
+        if not payload:
+            return None
+        if "extract" not in payload:
+            return None
+        extract = normalize_spaces(str(payload.get("extract", "")))
+        if not extract:
+            return None
+        page_url = (
+            payload.get("content_urls", {})
+            .get("desktop", {})
+            .get("page", "")
+        )
+        return {
+            "title": str(payload.get("title", title)),
+            "extract": extract,
+            "url": str(page_url),
+        }
+
+    direct = fetch_summary_direct(term)
+    if direct:
+        _WIKIPEDIA_SUMMARY_CACHE[key] = direct
+        return direct
+
+    search_url = (
+        "https://en.wikipedia.org/w/api.php?action=query&list=search"
+        f"&format=json&srlimit=1&srsearch={quote(term)}"
+    )
+    try:
+        search_payload = parse_json(fetch_text(search_url))
+    except Exception:
+        search_payload = None
+
+    best_title = (
+        (search_payload or {})
+        .get("query", {})
+        .get("search", [{}])[0]
+        .get("title")
+    )
+    if isinstance(best_title, str) and best_title.strip():
+        looked_up = fetch_summary_direct(best_title.strip())
+        _WIKIPEDIA_SUMMARY_CACHE[key] = looked_up
+        return looked_up
+
+    _WIKIPEDIA_SUMMARY_CACHE[key] = None
+    return None
+
+
+def build_company_research(company_name: str) -> str:
     if company_name in _COMPANY_PROFILE_CACHE:
         return _COMPANY_PROFILE_CACHE[company_name]
 
-    context = (
-        f"{company_name} develops medical technology solutions for healthcare providers and patients."
+    if not company_name or company_name == "The company":
+        fallback = (
+            "The headline does not include a clear company name, so deeper profile lookup was skipped "
+            "to avoid guessing."
+        )
+        _COMPANY_PROFILE_CACHE[company_name] = fallback
+        return fallback
+
+    summary = wikipedia_summary(company_name)
+    if summary:
+        detail = first_sentences(summary["extract"], count=2)
+        if summary["url"]:
+            detail = f"{detail} Source: {summary['url']}"
+        _COMPANY_PROFILE_CACHE[company_name] = detail
+        return detail
+
+    fallback = (
+        f"Public profile data for {company_name} was limited from open sources in this run. "
+        "From the headline context, it appears active in medtech/biomedical innovation."
     )
-    best_product = fallback_product or "Not clearly specified in the headline"
-
-    if company_name and company_name != "The company":
-        wiki_url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{quote(company_name)}"
-        try:
-            payload = fetch_text(wiki_url)
-            # Very lightweight extraction from JSON text without extra dependencies.
-            extract_match = re.search(r'"extract":"(.*?)"', payload)
-            if extract_match:
-                extract = extract_match.group(1)
-                extract = (
-                    extract.replace("\\n", " ")
-                    .replace('\\"', '"')
-                    .replace("\\/", "/")
-                )
-                first_sentence = extract.split(". ")[0].strip()
-                if first_sentence:
-                    context = first_sentence + "."
-                product_match = re.search(
-                    r"(?:known for)\s+([^.,;]{6,100})",
-                    extract,
-                    flags=re.IGNORECASE,
-                )
-                if product_match:
-                    best_product = product_match.group(1).strip()
-        except Exception:
-            pass
-
-    _COMPANY_PROFILE_CACHE[company_name] = (context, best_product)
-    return context, best_product
+    _COMPANY_PROFILE_CACHE[company_name] = fallback
+    return fallback
 
 
-def simple_product_sentence(product_name: str | None) -> str:
-    if not product_name:
-        return "The headline does not clearly name a specific product."
-    return (
-        f"In simple words, {product_name} is a medical solution meant to help doctors or patients "
-        "diagnose, monitor, or treat a health condition."
-    )
+def product_category(product_name: str, headline: str) -> str:
+    value = f"{product_name} {headline}".lower()
+    if any(token in value for token in ["robotic", "surgery", "surgical"]):
+        return "robotic_surgery"
+    if any(token in value for token in ["glucose", "sensor", "monitor", "wearable"]):
+        return "monitoring"
+    if any(token in value for token in ["imaging", "ultrasound", "mri", "ct", "scan"]):
+        return "imaging"
+    if any(token in value for token in ["stent", "valve", "implant", "pacemaker"]):
+        return "implant"
+    if any(token in value for token in ["diagnostic", "test", "assay", "sequencing"]):
+        return "diagnostic"
+    if any(token in value for token in ["therapy", "drug", "biologic", "gene", "treatment"]):
+        return "therapy"
+    return "general"
 
 
-def scientific_product_sentence(product_name: str | None) -> str:
-    if not product_name:
-        return (
-            "From a scientific perspective, no explicit intervention name is provided, so mechanism-level "
-            "interpretation remains limited."
-        )
-    return (
-        f"In scientific terms, {product_name} represents a clinical intervention or medtech modality "
-        "intended to improve measurable outcomes through targeted diagnostic or therapeutic mechanisms."
-    )
+def product_explanations(product_name: str, headline: str, product_summary: str) -> tuple[str, str]:
+    category = product_category(product_name, headline)
+    display_name = product_name[:1].upper() + product_name[1:]
+
+    easy_templates = {
+        "robotic_surgery": (
+            f"{display_name} helps surgeons perform procedures with steadier and more precise movements. "
+            "Think of it like power steering for the surgeon's hands."
+        ),
+        "monitoring": (
+            f"{display_name} tracks important body signals continuously so issues can be spotted early. "
+            "Think of it like a live dashboard for the human body."
+        ),
+        "imaging": (
+            f"{display_name} helps clinicians see inside the body without large incisions. "
+            "Think of it like switching from a rough map to a high-resolution GPS view."
+        ),
+        "implant": (
+            f"{display_name} works like a hardware upgrade placed inside the body to support a failing function. "
+            "Think of it as replacing a worn mechanical part in a machine."
+        ),
+        "diagnostic": (
+            f"{display_name} is used to detect disease-related signals so treatment decisions can be made faster. "
+            "Think of it like a highly specific smoke detector for biology."
+        ),
+        "therapy": (
+            f"{display_name} is designed to intervene directly in a disease process to improve outcomes. "
+            "Think of it like fixing a control loop instead of only observing it."
+        ),
+        "general": (
+            f"{display_name} is a medical technology designed to improve how clinicians diagnose, monitor, or treat patients. "
+            "Think of it as an engineering tool that turns weak biological signals into useful clinical action."
+        ),
+    }
+    technical_templates = {
+        "robotic_surgery": (
+            "Engineering view: this is a mechatronic control system where surgeon inputs are mapped to robotic "
+            "end-effectors using kinematics, tremor filtering, and motion scaling for precision at the tissue interface."
+        ),
+        "monitoring": (
+            "Engineering view: this follows a sensor pipeline: transduction of a physiological signal, analog/digital "
+            "noise filtering, algorithmic estimation, then threshold-based clinical alerting."
+        ),
+        "imaging": (
+            "Engineering view: the system captures energy interactions with tissue and reconstructs an image through "
+            "signal processing, similar to solving an inverse problem from noisy measurements."
+        ),
+        "implant": (
+            "Engineering view: this combines biocompatible materials with mechanical and sometimes electronic subsystems "
+            "to restore function while maintaining stable long-term interaction with tissue."
+        ),
+        "diagnostic": (
+            "Engineering view: the test converts a biological event into a measurable output signal, then applies "
+            "calibration and decision thresholds to separate true disease signals from background noise."
+        ),
+        "therapy": (
+            "Engineering view: the intervention targets a specific biological pathway and aims to shift system behavior "
+            "toward a healthier equilibrium, similar to tuning a feedback controller."
+        ),
+        "general": (
+            "Engineering view: treat it as a full system chain from sensing or intervention, through processing and control, "
+            "to a measurable clinical endpoint."
+        ),
+    }
+
+    easy = easy_templates[category]
+    technical = technical_templates[category]
+    if product_summary:
+        summary_sentence = first_sentences(product_summary, count=1)
+        easy = f"{summary_sentence} {easy}"
+    return easy, technical
 
 
-def implications_sentence(title: str) -> str:
-    lower = title.lower()
-    if any(token in lower for token in ["fda", "approval", "clearance", "coverage nod", "ce mark"]):
-        return (
-            "These events typically increase commercialization probability, support reimbursement pathways, "
-            "and can accelerate adoption by hospitals and clinicians."
-        )
-    if any(token in lower for token in ["phase", "trial", "dosed", "study"]):
-        return (
-            "These events usually de-risk the clinical program, influence the next regulatory milestone, "
-            "and can materially affect partnership or financing leverage."
-        )
-    if any(token in lower for token in ["acquire", "acquisition", "invest", "partnership", "merger"]):
-        return (
-            "These events often lead to capability expansion, faster product development cycles, and "
-            "potential revenue synergy, while adding integration execution risk."
-        )
-    if any(token in lower for token in ["warning letter", "compliance", "resolves"]):
-        return (
-            "These events generally reduce regulatory overhang and operational risk, which can improve "
-            "supply continuity and customer confidence."
-        )
-    return (
-        "These events typically shape near-term strategic priorities and can influence market positioning, "
-        "capital allocation, and adoption momentum."
-    )
+def build_product_research(product_name: str, headline: str) -> tuple[str, str, str]:
+    summary = wikipedia_summary(f"{product_name} medical") or wikipedia_summary(product_name)
+    summary_extract = summary["extract"] if summary else ""
+    source_url = summary["url"] if summary else ""
+    easy, technical = product_explanations(product_name, headline, summary_extract)
+    return easy, technical, source_url
 
 
 def build_top_headline_message() -> tuple[str, str]:
@@ -447,15 +569,18 @@ def build_top_headline_message() -> tuple[str, str]:
     for index, item in enumerate(top_items, start=1):
         company_name = infer_company_name(item.title)
         product_name = infer_product_name(item.title, company_name)
-        context_sentence, best_product = fetch_company_profile(company_name, product_name)
+        company_research = build_company_research(company_name)
 
         lines.append(f"{to_roman(index)} - {item.title}")
-        lines.append(
-            f"Context: {context_sentence} Best product: {best_product}."
-        )
-        lines.append(f"Product (simple): {simple_product_sentence(product_name)}")
-        lines.append(f"Product (scientific): {scientific_product_sentence(product_name)}")
-        lines.append(f"Implications: {implications_sentence(item.title)}")
+        lines.append(f"Company Research: {company_research}")
+        if product_name:
+            product_easy, product_technical, product_source = build_product_research(
+                product_name, item.title
+            )
+            lines.append(f"Product Research (easy): {product_easy}")
+            lines.append(f"Product Research (tech): {product_technical}")
+            if product_source:
+                lines.append(f"Product Source: {product_source}")
         lines.append(
             "Link / Date: "
             f"{item.url} | {item.published_at.strftime('%Y-%m-%d %H:%M UTC')}"
