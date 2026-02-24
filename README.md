@@ -1,6 +1,9 @@
-# Daily MedTech/Biomedical Top Headline Email (GitHub Actions)
+# Daily MedTech/Biomedical Report Email (GitHub Actions)
 
-This project sends one daily email containing the top 3-4 biomedical/medtech headlines from 5 selected outlets:
+This project sends one daily email containing:
+
+- Top 3-4 biomedical/medtech headlines from 5 selected outlets
+- Top FDA/trial updates from free official APIs (`openFDA` + `ClinicalTrials.gov`)
 
 - MedTech Dive
 - MassDevice
@@ -26,15 +29,24 @@ Set these in:
 Optional:
 
 - `HEADLINE_COUNT` (3 or 4, defaults to 4)
+- `REGULATORY_COUNT` (2 to 4, defaults to 3)
 
 ## Email Format
 
-Each headline is formatted as:
+Section 1: `Headlines`
 
 - `I - ...`
 - Company research (separate lookup)
 - Product research in easy terms + engineering explanation (only if product is mentioned)
 - Link / date of release
+
+Section 2: `FDA & Trial Updates`
+
+- `I - ...`
+- Status (approval/clearance/rejection/trial result)
+- Company research (separate lookup)
+- Product research in easy terms + engineering explanation (only if product is mentioned)
+- Event details + official source link/date
 
 ## Schedule
 

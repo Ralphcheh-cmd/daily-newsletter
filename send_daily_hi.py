@@ -7,10 +7,10 @@ import re
 import smtplib
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -23,6 +23,9 @@ def require_env(name: str) -> str:
 
 USER_AGENT = "daily-medtech-headline-bot/1.0 (contact: recdosec@gmail.com)"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+OPENFDA_PMA_API = "https://api.fda.gov/device/pma.json"
+OPENFDA_510K_API = "https://api.fda.gov/device/510k.json"
+CTGOV_STUDIES_API = "https://clinicaltrials.gov/api/v2/studies"
 STOPWORDS = {
     "the",
     "and",
@@ -107,6 +110,19 @@ class NewsItem:
     outlet_name: str
     outlet_domain: str
     published_at: datetime
+    score: float = 0.0
+
+
+@dataclass
+class RegulatoryItem:
+    title: str
+    company_name: str
+    product_name: str | None
+    source_name: str
+    source_url: str
+    event_date: datetime
+    status_label: str
+    detail: str
     score: float = 0.0
 
 
@@ -258,6 +274,358 @@ def collect_top_headlines() -> list[NewsItem]:
     return deduped[: desired_headline_count()]
 
 
+def desired_regulatory_count() -> int:
+    raw = os.getenv("REGULATORY_COUNT", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 3
+    if value < 2:
+        return 2
+    if value > 4:
+        return 4
+    return value
+
+
+def fetch_json(url: str, params: dict[str, str]) -> dict | None:
+    query = urlencode(params, quote_via=quote_plus)
+    full_url = f"{url}?{query}"
+    try:
+        return parse_json(fetch_text(full_url))
+    except Exception as exc:
+        print(f"Warning: API fetch failed for {url}: {exc}")
+        return None
+
+
+def safe_date(value: str | None) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    raw = value.strip()
+    if not raw:
+        return datetime.now(timezone.utc)
+
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d", "%Y-%m", "%Y%m%d"):
+        try:
+            dt = datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return datetime.now(timezone.utc)
+
+
+def regulatory_recency_score(event_date: datetime) -> float:
+    age_days = max(0.0, (datetime.now(timezone.utc) - event_date).total_seconds() / 86400.0)
+    return max(0.0, (120.0 - age_days) / 30.0)
+
+
+def regulatory_status_weight(status_label: str) -> float:
+    lower = status_label.lower()
+    if "rejection" in lower:
+        return 3.2
+    if "approval" in lower or "clearance" in lower or "grant" in lower:
+        return 2.8
+    if "trial results" in lower:
+        return 2.3
+    return 1.6
+
+
+def pma_status_label(decision_code: str) -> str:
+    code = decision_code.strip().upper()
+    if code in {"APPR", "APRL", "OK30"}:
+        return "FDA PMA approval"
+    if code.startswith("DEN") or "REJ" in code:
+        return "FDA PMA rejection"
+    if code:
+        return f"FDA PMA decision ({code})"
+    return "FDA PMA decision"
+
+
+def k510_status_label(decision_code: str, decision_description: str) -> str:
+    code = decision_code.strip().upper()
+    description = decision_description.strip().lower()
+    if code.startswith("NSE") or "not substantially equivalent" in description:
+        return "FDA 510(k) rejection"
+    if code.startswith("SES") or "substantially equivalent" in description:
+        return "FDA 510(k) clearance"
+    if code == "DENG":
+        return "FDA De Novo grant"
+    if code:
+        return f"FDA 510(k) decision ({code})"
+    return "FDA 510(k) decision"
+
+
+def pma_source_url(pma_number: str) -> str:
+    if not pma_number:
+        return "https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfpma/pma.cfm"
+    return (
+        "https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfpma/pma.cfm"
+        f"?id={quote_plus(pma_number)}"
+    )
+
+
+def k510_source_url(k_number: str) -> str:
+    if not k_number:
+        return "https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfpmn/pmn.cfm"
+    return (
+        "https://www.accessdata.fda.gov/scripts/cdrh/cfdocs/cfpmn/pmn.cfm"
+        f"?ID={quote_plus(k_number)}"
+    )
+
+
+def fetch_openfda_pma_updates(limit: int = 24) -> list[RegulatoryItem]:
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=120)).strftime("%Y%m%d")
+    end = now.strftime("%Y%m%d")
+    payload = fetch_json(
+        OPENFDA_PMA_API,
+        {
+            "search": f"decision_date:[{start} TO {end}]",
+            "limit": str(limit),
+            "sort": "decision_date:desc",
+        },
+    )
+    if not payload:
+        return []
+
+    updates: list[RegulatoryItem] = []
+    for row in payload.get("results", []):
+        if not isinstance(row, dict):
+            continue
+        company_name = normalize_spaces(str(row.get("applicant", ""))) or "Unknown applicant"
+        product_name = (
+            normalize_spaces(str(row.get("trade_name", "")))
+            or normalize_spaces(str(row.get("openfda", {}).get("device_name", "")))
+            or normalize_spaces(str(row.get("generic_name", "")))
+            or None
+        )
+        pma_number = normalize_spaces(str(row.get("pma_number", "")))
+        decision_code = normalize_spaces(str(row.get("decision_code", "")))
+        status_label = pma_status_label(decision_code)
+        event_date = safe_date(str(row.get("decision_date", "")))
+        supplement_reason = normalize_spaces(str(row.get("supplement_reason", "")))
+        ao_statement = first_sentences(str(row.get("ao_statement", "")), count=1)
+
+        detail_parts = [f"Decision code: {decision_code or 'N/A'}."]
+        if supplement_reason:
+            detail_parts.append(f"Reason: {supplement_reason}.")
+        if ao_statement:
+            detail_parts.append(f"FDA note: {ao_statement}")
+        detail = " ".join(part for part in detail_parts if part).strip()
+        title_core = product_name or pma_number or "PMA device update"
+
+        item = RegulatoryItem(
+            title=f"{status_label}: {title_core}",
+            company_name=company_name,
+            product_name=product_name,
+            source_name="openFDA PMA",
+            source_url=pma_source_url(pma_number),
+            event_date=event_date,
+            status_label=status_label,
+            detail=detail,
+        )
+        item.score = regulatory_status_weight(status_label) + regulatory_recency_score(event_date)
+        updates.append(item)
+    return updates
+
+
+def fetch_openfda_510k_updates(limit: int = 30) -> list[RegulatoryItem]:
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=120)).strftime("%Y%m%d")
+    end = now.strftime("%Y%m%d")
+    payload = fetch_json(
+        OPENFDA_510K_API,
+        {
+            "search": f"decision_date:[{start} TO {end}]",
+            "limit": str(limit),
+            "sort": "decision_date:desc",
+        },
+    )
+    if not payload:
+        return []
+
+    updates: list[RegulatoryItem] = []
+    for row in payload.get("results", []):
+        if not isinstance(row, dict):
+            continue
+        company_name = normalize_spaces(str(row.get("applicant", ""))) or "Unknown applicant"
+        product_name = (
+            normalize_spaces(str(row.get("device_name", "")))
+            or normalize_spaces(str(row.get("openfda", {}).get("device_name", "")))
+            or None
+        )
+        decision_code = normalize_spaces(str(row.get("decision_code", "")))
+        decision_description = normalize_spaces(str(row.get("decision_description", "")))
+        status_label = k510_status_label(decision_code, decision_description)
+        event_date = safe_date(str(row.get("decision_date", "")))
+        k_number = normalize_spaces(str(row.get("k_number", "")))
+        clearance_type = normalize_spaces(str(row.get("clearance_type", "")))
+        detail_parts = [f"Decision code: {decision_code or 'N/A'}."]
+        if decision_description and decision_description.lower() != "unknown":
+            detail_parts.append(f"Decision: {decision_description}.")
+        if clearance_type:
+            detail_parts.append(f"Pathway: {clearance_type}.")
+
+        title_core = product_name or k_number or "510(k) device update"
+        item = RegulatoryItem(
+            title=f"{status_label}: {title_core}",
+            company_name=company_name,
+            product_name=product_name,
+            source_name="openFDA 510(k)",
+            source_url=k510_source_url(k_number),
+            event_date=event_date,
+            status_label=status_label,
+            detail=" ".join(detail_parts).strip(),
+        )
+        item.score = regulatory_status_weight(status_label) + regulatory_recency_score(event_date)
+        updates.append(item)
+    return updates
+
+
+def trial_sponsor_bias(sponsor_name: str) -> float:
+    lowered = sponsor_name.lower()
+    academic_tokens = ("university", "hospital", "medical center", "college", "institute")
+    return -0.3 if any(token in lowered for token in academic_tokens) else 0.4
+
+
+def fetch_recent_trial_result_updates(limit: int = 20) -> list[RegulatoryItem]:
+    now = datetime.now(timezone.utc)
+    start_iso = (now - timedelta(days=120)).strftime("%Y-%m-%d")
+    query = (
+        "AREA[HasResults]true AND AREA[InterventionType]DEVICE "
+        f"AND AREA[ResultsFirstPostDate]RANGE[{start_iso},MAX]"
+    )
+    payload = fetch_json(
+        CTGOV_STUDIES_API,
+        {
+            "query.term": query,
+            "pageSize": str(limit),
+            "fields": (
+                "NCTId,BriefTitle,LeadSponsorName,InterventionName,HasResults,"
+                "ResultsFirstPostDateStruct,PrimaryCompletionDateStruct,Condition"
+            ),
+        },
+    )
+    if not payload:
+        return []
+
+    updates: list[RegulatoryItem] = []
+    for study in payload.get("studies", []):
+        if not isinstance(study, dict):
+            continue
+        protocol = study.get("protocolSection", {})
+        if not isinstance(protocol, dict):
+            continue
+
+        ident = protocol.get("identificationModule", {})
+        status = protocol.get("statusModule", {})
+        sponsor_mod = protocol.get("sponsorCollaboratorsModule", {})
+        conditions_mod = protocol.get("conditionsModule", {})
+        arms_mod = protocol.get("armsInterventionsModule", {})
+
+        nct_id = normalize_spaces(str((ident or {}).get("nctId", "")))
+        brief_title = normalize_spaces(str((ident or {}).get("briefTitle", "")))
+        sponsor_name = normalize_spaces(
+            str((sponsor_mod or {}).get("leadSponsor", {}).get("name", ""))
+        ) or "Study sponsor"
+        results_date = normalize_spaces(
+            str((status or {}).get("resultsFirstPostDateStruct", {}).get("date", ""))
+        )
+        if not results_date:
+            continue
+
+        interventions = (arms_mod or {}).get("interventions", [])
+        product_name = None
+        if isinstance(interventions, list) and interventions:
+            first_intervention = interventions[0]
+            if isinstance(first_intervention, dict):
+                product_name = normalize_spaces(str(first_intervention.get("name", ""))) or None
+
+        conditions = (conditions_mod or {}).get("conditions", [])
+        condition_text = ""
+        if isinstance(conditions, list) and conditions:
+            named_conditions = [normalize_spaces(str(value)) for value in conditions[:2] if str(value).strip()]
+            if named_conditions:
+                condition_text = ", ".join(named_conditions)
+
+        event_date = safe_date(results_date)
+        detail = f"Clinical trial results were posted on {results_date}."
+        if condition_text:
+            detail += f" Primary conditions: {condition_text}."
+        source_url = (
+            f"https://clinicaltrials.gov/study/{quote_plus(nct_id)}"
+            if nct_id
+            else "https://clinicaltrials.gov/"
+        )
+        item = RegulatoryItem(
+            title=f"Clinical trial results posted: {brief_title or nct_id or 'Device study'}",
+            company_name=sponsor_name,
+            product_name=product_name,
+            source_name="ClinicalTrials.gov",
+            source_url=source_url,
+            event_date=event_date,
+            status_label="Clinical trial results posted",
+            detail=detail,
+        )
+        item.score = (
+            regulatory_status_weight(item.status_label)
+            + regulatory_recency_score(event_date)
+            + trial_sponsor_bias(sponsor_name)
+        )
+        updates.append(item)
+    return updates
+
+
+def regulatory_dedupe_key(item: RegulatoryItem) -> str:
+    return normalize_title_key(f"{item.title} {item.company_name} {item.source_name}")
+
+
+def collect_regulatory_updates() -> list[RegulatoryItem]:
+    collected: list[RegulatoryItem] = []
+    collected.extend(fetch_openfda_pma_updates())
+    collected.extend(fetch_openfda_510k_updates())
+    collected.extend(fetch_recent_trial_result_updates())
+    if not collected:
+        return []
+
+    sorted_items = sorted(
+        collected,
+        key=lambda item: (item.score, item.event_date),
+        reverse=True,
+    )
+
+    chosen: list[RegulatoryItem] = []
+    seen: set[str] = set()
+
+    # Keep source diversity by attempting to include at least one trial update when available.
+    trial_item = next(
+        (item for item in sorted_items if item.source_name == "ClinicalTrials.gov"),
+        None,
+    )
+    if trial_item:
+        key = regulatory_dedupe_key(trial_item)
+        seen.add(key)
+        chosen.append(trial_item)
+
+    for item in sorted_items:
+        key = regulatory_dedupe_key(item)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        chosen.append(item)
+        if len(chosen) >= desired_regulatory_count():
+            break
+    return chosen[: desired_regulatory_count()]
+
+
 def clean_company_name(name: str) -> str:
     value = re.sub(r"\s+", " ", name).strip(" -,:;.")
     parts = value.split()
@@ -360,6 +728,20 @@ def first_sentences(text: str, count: int = 2) -> str:
     return " ".join(chunks[:count]).strip()
 
 
+def lookup_tokens(text: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", text.lower()) if len(token) >= 3}
+
+
+def wiki_title_matches_query(query: str, title: str) -> bool:
+    query_tokens = lookup_tokens(query)
+    title_tokens = lookup_tokens(title)
+    if not query_tokens or not title_tokens:
+        return False
+    if query_tokens.intersection(title_tokens):
+        return True
+    return False
+
+
 def wikipedia_summary(term: str) -> dict[str, str] | None:
     key = term.strip().lower()
     if not key:
@@ -405,14 +787,18 @@ def wikipedia_summary(term: str) -> dict[str, str] | None:
     except Exception:
         search_payload = None
 
-    best_title = (
-        (search_payload or {})
-        .get("query", {})
-        .get("search", [{}])[0]
-        .get("title")
-    )
+    search_rows = (search_payload or {}).get("query", {}).get("search", [])
+    best_title = None
+    if isinstance(search_rows, list) and search_rows:
+        first_row = search_rows[0]
+        if isinstance(first_row, dict):
+            best_title = first_row.get("title")
     if isinstance(best_title, str) and best_title.strip():
-        looked_up = fetch_summary_direct(best_title.strip())
+        candidate_title = best_title.strip()
+        if not wiki_title_matches_query(term, candidate_title):
+            _WIKIPEDIA_SUMMARY_CACHE[key] = None
+            return None
+        looked_up = fetch_summary_direct(candidate_title)
         _WIKIPEDIA_SUMMARY_CACHE[key] = looked_up
         return looked_up
 
@@ -450,17 +836,18 @@ def build_company_research(company_name: str) -> str:
 
 def product_category(product_name: str, headline: str) -> str:
     value = f"{product_name} {headline}".lower()
-    if any(token in value for token in ["robotic", "surgery", "surgical"]):
+    tokens = set(re.findall(r"[a-z0-9]+", value))
+    if any(token in tokens for token in ["robotic", "surgery", "surgical"]):
         return "robotic_surgery"
-    if any(token in value for token in ["glucose", "sensor", "monitor", "wearable"]):
+    if any(token in tokens for token in ["glucose", "sensor", "monitor", "wearable"]):
         return "monitoring"
-    if any(token in value for token in ["imaging", "ultrasound", "mri", "ct", "scan"]):
+    if any(token in tokens for token in ["imaging", "ultrasound", "mri", "ct", "scan"]):
         return "imaging"
-    if any(token in value for token in ["stent", "valve", "implant", "pacemaker"]):
+    if any(token in tokens for token in ["stent", "valve", "implant", "pacemaker"]):
         return "implant"
-    if any(token in value for token in ["diagnostic", "test", "assay", "sequencing"]):
+    if any(token in tokens for token in ["diagnostic", "test", "assay", "sequencing"]):
         return "diagnostic"
-    if any(token in value for token in ["therapy", "drug", "biologic", "gene", "treatment"]):
+    if any(token in tokens for token in ["therapy", "drug", "biologic", "gene", "treatment"]):
         return "therapy"
     return "general"
 
@@ -548,24 +935,25 @@ def build_product_research(product_name: str, headline: str) -> tuple[str, str, 
 
 def build_top_headline_message() -> tuple[str, str]:
     top_items = collect_top_headlines()
-    if not top_items:
-        subject = (
-            f"Daily MedTech/Biomedical Headlines | "
-            f"{datetime.now(timezone.utc).date().isoformat()}"
-        )
+    regulatory_items = collect_regulatory_updates()
+    if not top_items and not regulatory_items:
+        subject = f"Daily MedTech/Biomedical Report | {datetime.now(timezone.utc).date().isoformat()}"
         body = (
-            "No headlines were found today from the selected medtech/biomedical outlets.\n"
-            "Checked outlets: "
+            "No headline or regulatory updates were found today from configured sources.\n"
+            "Checked headline outlets: "
             + ", ".join(outlet.name for outlet in OUTLETS)
-            + "\n"
+            + "\nChecked regulatory feeds: openFDA PMA, openFDA 510(k), ClinicalTrials.gov\n"
         )
         return subject, body
 
     subject = (
-        f"Top {len(top_items)} MedTech/Biomedical Headlines | "
+        f"MedTech Daily Report | {len(top_items)} Headlines + {len(regulatory_items)} FDA/Trial Updates | "
         f"{datetime.now(timezone.utc).date().isoformat()}"
     )
-    lines: list[str] = ["General News:", ""]
+    lines: list[str] = ["Headlines:", ""]
+    if not top_items:
+        lines.append("No recent medtech headlines were selected from the configured outlets today.")
+        lines.append("")
     for index, item in enumerate(top_items, start=1):
         company_name = infer_company_name(item.title)
         product_name = infer_product_name(item.title, company_name)
@@ -586,6 +974,31 @@ def build_top_headline_message() -> tuple[str, str]:
             f"{item.url} | {item.published_at.strftime('%Y-%m-%d %H:%M UTC')}"
         )
         lines.append("")
+
+    lines.append("FDA & Trial Updates:")
+    lines.append("")
+    if not regulatory_items:
+        lines.append("No recent FDA/trial events were selected from openFDA and ClinicalTrials.gov today.")
+        lines.append("")
+    else:
+        for index, item in enumerate(regulatory_items, start=1):
+            lines.append(f"{to_roman(index)} - {item.title}")
+            lines.append(f"Status: {item.status_label}")
+            lines.append(f"Company Research: {build_company_research(item.company_name)}")
+            if item.product_name:
+                product_easy, product_technical, product_source = build_product_research(
+                    item.product_name, item.title
+                )
+                lines.append(f"Product Research (easy): {product_easy}")
+                lines.append(f"Product Research (tech): {product_technical}")
+                if product_source:
+                    lines.append(f"Product Source: {product_source}")
+            lines.append(f"Event Detail: {item.detail}")
+            lines.append(
+                "Link / Date: "
+                f"{item.source_url} | {item.event_date.strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+            lines.append("")
     lines.append(f"Generated at (UTC): {datetime.now(timezone.utc).isoformat()}")
     body = "\n".join(lines).strip() + "\n"
     return subject, body
