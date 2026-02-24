@@ -5,11 +5,13 @@ import json
 import os
 import re
 import smtplib
+import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
+from urllib.error import HTTPError
 from urllib.parse import quote, quote_plus, urlencode
 from urllib.request import Request, urlopen
 
@@ -131,6 +133,8 @@ class RegulatoryItem:
 _COMPANY_PROFILE_CACHE: dict[str, str] = {}
 _WIKIPEDIA_SUMMARY_CACHE: dict[str, dict[str, str] | None] = {}
 _PUBMED_CACHE: dict[str, list[dict[str, str]]] = {}
+_PUBMED_DISABLED = False
+_PUBMED_LAST_CALL_TS = 0.0
 
 
 def fetch_text(url: str) -> str:
@@ -308,6 +312,15 @@ def pubmed_contact_email() -> str:
     )
 
 
+def wait_for_pubmed_slot(min_interval_sec: float = 0.4) -> None:
+    global _PUBMED_LAST_CALL_TS
+    now = time.time()
+    elapsed = now - _PUBMED_LAST_CALL_TS
+    if elapsed < min_interval_sec:
+        time.sleep(min_interval_sec - elapsed)
+    _PUBMED_LAST_CALL_TS = time.time()
+
+
 def xml_node_text(node: ET.Element | None) -> str:
     if node is None:
         return ""
@@ -315,13 +328,16 @@ def xml_node_text(node: ET.Element | None) -> str:
 
 
 def fetch_pubmed_papers(query: str, max_results: int = 3) -> list[dict[str, str]]:
+    global _PUBMED_DISABLED
+
+    if _PUBMED_DISABLED:
+        return []
     cache_key = f"{query.strip().lower()}::{max_results}"
     if cache_key in _PUBMED_CACHE:
         return _PUBMED_CACHE[cache_key]
 
     email = pubmed_contact_email()
-    search_payload = fetch_json(
-        PUBMED_ESEARCH_API,
+    search_query = urlencode(
         {
             "db": "pubmed",
             "term": query,
@@ -331,7 +347,24 @@ def fetch_pubmed_papers(query: str, max_results: int = 3) -> list[dict[str, str]
             "tool": "medtech-newsletter",
             "email": email,
         },
+        quote_via=quote_plus,
     )
+    try:
+        wait_for_pubmed_slot()
+        search_payload = parse_json(fetch_text(f"{PUBMED_ESEARCH_API}?{search_query}"))
+    except HTTPError as exc:
+        if exc.code == 429:
+            _PUBMED_DISABLED = True
+            print("Warning: PubMed rate limit reached (429). Skipping further PubMed calls for this run.")
+        else:
+            print(f"Warning: PubMed search failed ({exc.code}) for query: {query}")
+        _PUBMED_CACHE[cache_key] = []
+        return []
+    except Exception as exc:
+        print(f"Warning: PubMed search failed for query '{query}': {exc}")
+        _PUBMED_CACHE[cache_key] = []
+        return []
+
     ids = (
         (search_payload or {})
         .get("esearchresult", {})
@@ -341,19 +374,33 @@ def fetch_pubmed_papers(query: str, max_results: int = 3) -> list[dict[str, str]
         _PUBMED_CACHE[cache_key] = []
         return []
 
-    xml_text = fetch_text(
-        f"{PUBMED_EFETCH_API}?"
-        + urlencode(
-            {
-                "db": "pubmed",
-                "id": ",".join(ids),
-                "retmode": "xml",
-                "tool": "medtech-newsletter",
-                "email": email,
-            },
-            quote_via=quote_plus,
+    try:
+        wait_for_pubmed_slot()
+        xml_text = fetch_text(
+            f"{PUBMED_EFETCH_API}?"
+            + urlencode(
+                {
+                    "db": "pubmed",
+                    "id": ",".join(ids),
+                    "retmode": "xml",
+                    "tool": "medtech-newsletter",
+                    "email": email,
+                },
+                quote_via=quote_plus,
+            )
         )
-    )
+    except HTTPError as exc:
+        if exc.code == 429:
+            _PUBMED_DISABLED = True
+            print("Warning: PubMed rate limit reached (429) during efetch. Continuing without PubMed for this run.")
+        else:
+            print(f"Warning: PubMed efetch failed ({exc.code}) for query: {query}")
+        _PUBMED_CACHE[cache_key] = []
+        return []
+    except Exception as exc:
+        print(f"Warning: PubMed efetch failed for query '{query}': {exc}")
+        _PUBMED_CACHE[cache_key] = []
+        return []
 
     try:
         root = ET.fromstring(xml_text)
