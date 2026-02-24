@@ -4,6 +4,7 @@ This project sends one daily email containing:
 
 - Top 3-4 biomedical/medtech headlines from 5 selected outlets
 - Top FDA/trial updates from free official APIs (`openFDA` + `ClinicalTrials.gov`)
+- Deep product research using free `PubMed` APIs (NCBI E-utilities)
 
 - MedTech Dive
 - MassDevice
@@ -30,6 +31,7 @@ Optional:
 
 - `HEADLINE_COUNT` (3 or 4, defaults to 4)
 - `REGULATORY_COUNT` (2 to 4, defaults to 3)
+- `SEC_USER_AGENT_CONTACT_EMAIL` (used as contact email for API user-agent where required)
 
 ## Email Format
 

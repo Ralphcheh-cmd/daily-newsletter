@@ -26,6 +26,8 @@ GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 OPENFDA_PMA_API = "https://api.fda.gov/device/pma.json"
 OPENFDA_510K_API = "https://api.fda.gov/device/510k.json"
 CTGOV_STUDIES_API = "https://clinicaltrials.gov/api/v2/studies"
+PUBMED_ESEARCH_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+PUBMED_EFETCH_API = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
 STOPWORDS = {
     "the",
     "and",
@@ -128,6 +130,7 @@ class RegulatoryItem:
 
 _COMPANY_PROFILE_CACHE: dict[str, str] = {}
 _WIKIPEDIA_SUMMARY_CACHE: dict[str, dict[str, str] | None] = {}
+_PUBMED_CACHE: dict[str, list[dict[str, str]]] = {}
 
 
 def fetch_text(url: str) -> str:
@@ -295,6 +298,151 @@ def fetch_json(url: str, params: dict[str, str]) -> dict | None:
     except Exception as exc:
         print(f"Warning: API fetch failed for {url}: {exc}")
         return None
+
+
+def pubmed_contact_email() -> str:
+    return (
+        os.getenv("SEC_USER_AGENT_CONTACT_EMAIL", "").strip()
+        or os.getenv("SMTP_FROM", "").strip()
+        or "recdosec@gmail.com"
+    )
+
+
+def xml_node_text(node: ET.Element | None) -> str:
+    if node is None:
+        return ""
+    return normalize_spaces("".join(node.itertext()))
+
+
+def fetch_pubmed_papers(query: str, max_results: int = 3) -> list[dict[str, str]]:
+    cache_key = f"{query.strip().lower()}::{max_results}"
+    if cache_key in _PUBMED_CACHE:
+        return _PUBMED_CACHE[cache_key]
+
+    email = pubmed_contact_email()
+    search_payload = fetch_json(
+        PUBMED_ESEARCH_API,
+        {
+            "db": "pubmed",
+            "term": query,
+            "retmode": "json",
+            "retmax": str(max_results),
+            "sort": "relevance",
+            "tool": "medtech-newsletter",
+            "email": email,
+        },
+    )
+    ids = (
+        (search_payload or {})
+        .get("esearchresult", {})
+        .get("idlist", [])
+    )
+    if not isinstance(ids, list) or not ids:
+        _PUBMED_CACHE[cache_key] = []
+        return []
+
+    xml_text = fetch_text(
+        f"{PUBMED_EFETCH_API}?"
+        + urlencode(
+            {
+                "db": "pubmed",
+                "id": ",".join(ids),
+                "retmode": "xml",
+                "tool": "medtech-newsletter",
+                "email": email,
+            },
+            quote_via=quote_plus,
+        )
+    )
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        _PUBMED_CACHE[cache_key] = []
+        return []
+
+    papers: list[dict[str, str]] = []
+    for article in root.findall("./PubmedArticle"):
+        pmid = xml_node_text(article.find("./MedlineCitation/PMID"))
+        title = xml_node_text(article.find("./MedlineCitation/Article/ArticleTitle"))
+        abstract_parts = [
+            xml_node_text(node)
+            for node in article.findall("./MedlineCitation/Article/Abstract/AbstractText")
+        ]
+        abstract = normalize_spaces(" ".join(part for part in abstract_parts if part))
+        year = xml_node_text(article.find("./MedlineCitation/Article/Journal/JournalIssue/PubDate/Year"))
+        if not year:
+            year = xml_node_text(article.find("./MedlineCitation/Article/Journal/JournalIssue/PubDate/MedlineDate"))
+        journal = xml_node_text(article.find("./MedlineCitation/Article/Journal/Title"))
+
+        if not title and not abstract:
+            continue
+        papers.append(
+            {
+                "pmid": pmid,
+                "title": title,
+                "abstract": abstract,
+                "year": year,
+                "journal": journal,
+                "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "https://pubmed.ncbi.nlm.nih.gov/",
+            }
+        )
+
+    _PUBMED_CACHE[cache_key] = papers
+    return papers
+
+
+def pubmed_query_candidates(product_name: str) -> list[str]:
+    lower = product_name.lower()
+    candidates = [
+        f'"{product_name}"[Title/Abstract] AND (medical OR device OR clinical)',
+        f'"{product_name}"[Title/Abstract]',
+    ]
+
+    if "cgm" in lower or "glucose" in lower:
+        candidates.append('"continuous glucose monitoring"[Title/Abstract]')
+    if "pacing lead" in lower or "lbbap" in lower:
+        candidates.append('"left bundle branch area pacing"[Title/Abstract]')
+    if "weight loss balloon" in lower or "gastric balloon" in lower:
+        candidates.append('"intragastric balloon obesity"[Title/Abstract]')
+    if "pulmonary artery" in lower and "sensor" in lower:
+        candidates.append('"implantable pulmonary artery pressure sensor"[Title/Abstract]')
+    if "bone graft" in lower:
+        candidates.append('"bone graft spinal fusion recombinant"[Title/Abstract]')
+    if "gene therap" in lower:
+        candidates.append('"gene therapy viral vector"[Title/Abstract]')
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for value in candidates:
+        key = value.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(value)
+    return unique
+
+
+def select_product_pubmed_research(product_name: str) -> dict[str, str] | None:
+    best: dict[str, str] | None = None
+    best_score = -1
+
+    for query in pubmed_query_candidates(product_name):
+        papers = fetch_pubmed_papers(query, max_results=3)
+        for paper in papers:
+            abstract = paper.get("abstract", "")
+            title = paper.get("title", "")
+            score = len(abstract)
+            if title:
+                score += 30
+            if len(abstract) >= 180:
+                score += 100
+            if score > best_score:
+                best = paper
+                best_score = score
+        if best_score >= 150:
+            break
+    return best
 
 
 def safe_date(value: str | None) -> datetime:
@@ -733,13 +881,33 @@ def lookup_tokens(text: str) -> set[str]:
 
 
 def wiki_title_matches_query(query: str, title: str) -> bool:
-    query_tokens = lookup_tokens(query)
-    title_tokens = lookup_tokens(title)
+    generic_tokens = {
+        "medical",
+        "device",
+        "devices",
+        "therapy",
+        "therapies",
+        "treatment",
+        "clinical",
+        "study",
+        "system",
+        "implantable",
+        "monitor",
+        "monitoring",
+    }
+    query_tokens = lookup_tokens(query) - generic_tokens
+    title_tokens = lookup_tokens(title) - generic_tokens
+    if not query_tokens:
+        query_tokens = lookup_tokens(query)
+    if not title_tokens:
+        title_tokens = lookup_tokens(title)
     if not query_tokens or not title_tokens:
         return False
-    if query_tokens.intersection(title_tokens):
-        return True
-    return False
+
+    overlap = len(query_tokens.intersection(title_tokens))
+    if len(query_tokens) >= 3:
+        return overlap >= 2
+    return overlap >= 1
 
 
 def wikipedia_summary(term: str) -> dict[str, str] | None:
@@ -839,17 +1007,190 @@ def product_category(product_name: str, headline: str) -> str:
     tokens = set(re.findall(r"[a-z0-9]+", value))
     if any(token in tokens for token in ["robotic", "surgery", "surgical"]):
         return "robotic_surgery"
-    if any(token in tokens for token in ["glucose", "sensor", "monitor", "wearable"]):
+    if any(token in tokens for token in ["glucose", "sensor", "monitor", "wearable", "waveform", "pressure", "hemodynamic", "rhythm"]):
         return "monitoring"
     if any(token in tokens for token in ["imaging", "ultrasound", "mri", "ct", "scan"]):
         return "imaging"
-    if any(token in tokens for token in ["stent", "valve", "implant", "pacemaker"]):
+    if any(token in tokens for token in ["stent", "valve", "implant", "pacemaker", "lead", "graft", "balloon", "catheter"]):
         return "implant"
     if any(token in tokens for token in ["diagnostic", "test", "assay", "sequencing"]):
         return "diagnostic"
-    if any(token in tokens for token in ["therapy", "drug", "biologic", "gene", "treatment"]):
+    if any(token in tokens for token in ["therapy", "drug", "biologic", "gene", "treatment", "cell", "rna"]):
         return "therapy"
     return "general"
+
+
+def detect_technology_signals(context_text: str) -> list[str]:
+    text = context_text.lower()
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    signals: list[str] = []
+
+    def has_any(*keywords: str) -> bool:
+        for keyword in keywords:
+            key = keyword.lower().strip()
+            if not key:
+                continue
+            # For multi-word concepts we allow phrase matching in raw text.
+            if " " in key or "-" in key:
+                if key in text:
+                    return True
+                continue
+            # Single-word concepts should match token boundaries, not substrings.
+            if key in tokens:
+                return True
+        return False
+
+    if has_any("glucose", "biosensor", "electrochemical", "electrode", "interstitial"):
+        signals.append(
+            "The core sensing layer is likely electrochemical: a reactive interface converts analyte concentration "
+            "into an electrical signal, then calibration maps current/voltage into a clinically interpretable value."
+        )
+    if has_any("pressure", "hemodynamic", "waveform", "pulmonary", "artery", "intracranial"):
+        signals.append(
+            "The signal source appears pressure/hemodynamic: transducers capture waveform morphology, and digital "
+            "processing extracts trends (mean pressure, variability, slope) for early decompensation detection."
+        )
+    if has_any("optical", "laser", "infrared", "photon", "spectroscopy", "fluorescence"):
+        signals.append(
+            "The measurement path appears optical: emitted light interacts with tissue or analytes, and detectors "
+            "convert intensity/spectrum changes into digital features after denoising and normalization."
+        )
+    if has_any("ultrasound", "acoustic", "doppler"):
+        signals.append(
+            "The physics layer is acoustic: transmitted waves reflect from tissue boundaries, and time/frequency shifts "
+            "are reconstructed into structure or flow estimates."
+        )
+    if has_any("mri", "magnetic resonance", "rf coil"):
+        signals.append(
+            "The device relies on magnetic resonance principles: RF excitation and relaxation dynamics are sampled in "
+            "k-space and reconstructed into anatomical/functional contrast."
+        )
+    if has_any("ct", "xray", "x-ray", "radiography"):
+        signals.append(
+            "The imaging chain uses ionizing attenuation physics: projection data are acquired over angles and "
+            "reconstructed via inverse methods into cross-sectional structure."
+        )
+    if has_any("robot", "robotic", "kinematic", "manipulator", "actuator"):
+        signals.append(
+            "This is a mechatronic control system: surgeon/operator inputs are mapped through kinematic transforms "
+            "to actuators, with filtering and scaling to improve precision at the tool tip."
+        )
+    if has_any("implant", "lead", "stent", "valve", "pacemaker", "catheter", "prosthesis"):
+        signals.append(
+            "The hardware appears implant-centric: biocompatible materials and mechanical/electrical interfaces must "
+            "remain stable in vivo while preserving long-term performance and safety margins."
+        )
+    if has_any("graft", "bone", "fusion", "scaffold", "matrix"):
+        signals.append(
+            "The regenerative mechanism likely combines a structural matrix with osteogenic signaling cues to guide "
+            "cell migration, vascularization, and bone remodeling over time."
+        )
+    if has_any("gene therapy", "viral vector", "aav", "lentiviral", "transgene", "editing"):
+        signals.append(
+            "The therapeutic engine is likely vector-mediated delivery: a carrier introduces genetic payload into "
+            "target cells, and expression kinetics determine durability, potency, and off-target risk."
+        )
+    if has_any("assay", "diagnostic", "biomarker", "antigen", "antibody", "pcr", "sequencing", "microfluidic"):
+        signals.append(
+            "The analytical core likely converts a molecular event into a measurable signal, then applies thresholds "
+            "and quality controls to separate true positives from biological and instrument noise."
+        )
+    if has_any("algorithm", "software", "ai", "machine learning", "model", "classification", "reconstruction"):
+        signals.append(
+            "A computational layer is central: signal conditioning feeds feature extraction or predictive models that "
+            "translate raw measurements into risk scores or actionable classifications."
+        )
+    if has_any("stim", "stimulation", "neuromodulation", "ablation", "rf", "radiofrequency", "energy delivery"):
+        signals.append(
+            "Therapeutic effect is likely energy-mediated: controlled dose in time and space is delivered to a target "
+            "tissue pathway, balancing efficacy against off-target thermal/electrical effects."
+        )
+    if has_any("closed loop", "feedback", "controller", "pump", "dosing"):
+        signals.append(
+            "System behavior resembles closed-loop control: sensed state is compared to a target, and control actions "
+            "are adjusted iteratively to reduce error and maintain physiologic stability."
+        )
+    return signals
+
+
+def category_fallback_technical(category: str) -> str:
+    fallbacks = {
+        "robotic_surgery": (
+            "Technical view: the architecture combines perception, kinematics, and control. Sensors estimate tool "
+            "state, controllers filter tremor and scale motion, and actuators execute constrained trajectories."
+        ),
+        "monitoring": (
+            "Technical view: expect a pipeline of transduction -> analog front-end -> digital filtering -> trend "
+            "estimation -> alert logic. This is analogous to turning noisy IoT telemetry into reliable control-room KPIs."
+        ),
+        "imaging": (
+            "Technical view: the system measures a physical interaction field and solves an inverse reconstruction problem "
+            "to produce usable spatial information for diagnosis or guidance."
+        ),
+        "implant": (
+            "Technical view: performance depends on materials engineering, mechanics, and interface reliability under "
+            "chronic physiological loading, similar to designing long-life hardware for harsh environments."
+        ),
+        "diagnostic": (
+            "Technical view: the device maps biochemical interactions to sensor outputs, then uses calibration curves "
+            "and decision thresholds to control false positives/negatives."
+        ),
+        "therapy": (
+            "Technical view: intervention dosing is a control problem over a biological system with delays, nonlinearity, "
+            "and patient-to-patient variability."
+        ),
+        "general": (
+            "Technical view: treat the device as a layered system with sensing/intervention hardware, embedded signal "
+            "conditioning, and clinical decision logic driving outcome-oriented actions."
+        ),
+    }
+    return fallbacks.get(category, fallbacks["general"])
+
+
+def build_technical_explanation(
+    category: str, display_name: str, product_summary: str, headline: str
+) -> str:
+    context_text = " ".join(part for part in [display_name, headline, product_summary] if part).strip()
+    signals = detect_technology_signals(context_text)
+    summary_line = ""
+    if product_summary:
+        summary_line = first_sentences(product_summary, count=1)
+
+    lines: list[str] = [f"Engineering view for {display_name}:"]
+    if summary_line:
+        lines.append(summary_line)
+    if signals:
+        lines.extend(signals[:2])
+    else:
+        lines.append(category_fallback_technical(category))
+    lines.append(
+        "Think of this as a measured-physics-to-decision pipeline: convert raw biological phenomena into stable "
+        "state estimates, then use those estimates to guide clinical action."
+    )
+    return " ".join(lines)
+
+
+def select_product_summary(product_name: str) -> dict[str, str] | None:
+    paper = select_product_pubmed_research(product_name)
+    if paper:
+        title = normalize_spaces(paper.get("title", ""))
+        abstract = normalize_spaces(paper.get("abstract", ""))
+        year = normalize_spaces(paper.get("year", ""))
+        journal = normalize_spaces(paper.get("journal", ""))
+
+        summary_bits: list[str] = []
+        if title:
+            if year or journal:
+                evidence_meta = " ".join(part for part in [journal, year] if part)
+                summary_bits.append(f"{title} ({evidence_meta})." if evidence_meta else f"{title}.")
+            else:
+                summary_bits.append(f"{title}.")
+        if abstract:
+            summary_bits.append(first_sentences(abstract, count=2))
+        extract = normalize_spaces(" ".join(summary_bits))
+        if extract:
+            return {"extract": extract, "url": paper.get("url", "")}
+    return None
 
 
 def product_explanations(product_name: str, headline: str, product_summary: str) -> tuple[str, str]:
@@ -886,39 +1227,8 @@ def product_explanations(product_name: str, headline: str, product_summary: str)
             "Think of it as an engineering tool that turns weak biological signals into useful clinical action."
         ),
     }
-    technical_templates = {
-        "robotic_surgery": (
-            "Engineering view: this is a mechatronic control system where surgeon inputs are mapped to robotic "
-            "end-effectors using kinematics, tremor filtering, and motion scaling for precision at the tissue interface."
-        ),
-        "monitoring": (
-            "Engineering view: this follows a sensor pipeline: transduction of a physiological signal, analog/digital "
-            "noise filtering, algorithmic estimation, then threshold-based clinical alerting."
-        ),
-        "imaging": (
-            "Engineering view: the system captures energy interactions with tissue and reconstructs an image through "
-            "signal processing, similar to solving an inverse problem from noisy measurements."
-        ),
-        "implant": (
-            "Engineering view: this combines biocompatible materials with mechanical and sometimes electronic subsystems "
-            "to restore function while maintaining stable long-term interaction with tissue."
-        ),
-        "diagnostic": (
-            "Engineering view: the test converts a biological event into a measurable output signal, then applies "
-            "calibration and decision thresholds to separate true disease signals from background noise."
-        ),
-        "therapy": (
-            "Engineering view: the intervention targets a specific biological pathway and aims to shift system behavior "
-            "toward a healthier equilibrium, similar to tuning a feedback controller."
-        ),
-        "general": (
-            "Engineering view: treat it as a full system chain from sensing or intervention, through processing and control, "
-            "to a measurable clinical endpoint."
-        ),
-    }
-
     easy = easy_templates[category]
-    technical = technical_templates[category]
+    technical = build_technical_explanation(category, display_name, product_summary, headline)
     if product_summary:
         summary_sentence = first_sentences(product_summary, count=1)
         easy = f"{summary_sentence} {easy}"
@@ -926,7 +1236,7 @@ def product_explanations(product_name: str, headline: str, product_summary: str)
 
 
 def build_product_research(product_name: str, headline: str) -> tuple[str, str, str]:
-    summary = wikipedia_summary(f"{product_name} medical") or wikipedia_summary(product_name)
+    summary = select_product_summary(product_name)
     summary_extract = summary["extract"] if summary else ""
     source_url = summary["url"] if summary else ""
     easy, technical = product_explanations(product_name, headline, summary_extract)
